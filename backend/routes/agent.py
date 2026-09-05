@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 from flask import Blueprint, g, request
 from pydantic import ValidationError
 
@@ -48,14 +50,23 @@ def run():
     if not message.strip():
         return fail("Agent prompt is required.", 400, "INVALID_AGENT_PROMPT")
     try:
-        return ok(run_commerce_agent(message))
+        result = run_commerce_agent(message)
     except AgentPipelineError as exc:
         return fail(str(exc), exc.status, exc.code)
     except Exception as exc:
         if str(exc) == "INVALID_AGENT_PROMPT":
             return fail("Agent prompt is required.", 400, "INVALID_AGENT_PROMPT")
-        print(f"[agent] unexpected failure exception={type(exc).__name__}", flush=True)
+        message = str(exc)[:500]
+        print(f"[agent] unexpected failure exception={type(exc).__name__} message={message}", flush=True)
+        print("[agent] unexpected traceback=" + traceback.format_exc()[-4000:], flush=True)
         return fail("Commerce Agent is temporarily unavailable. Please try again.", 503, "AGENT_SERVICE_UNAVAILABLE")
+    try:
+        return ok(result)
+    except Exception as exc:
+        message = str(exc)[:500]
+        print(f"[agent] response serialization failed exception={type(exc).__name__} message={message}", flush=True)
+        print("[agent] response serialization traceback=" + traceback.format_exc()[-4000:], flush=True)
+        return fail("Commerce Agent is temporarily unavailable. Please try again.", 503, "AGENT_RESPONSE_SERIALIZATION_FAILED")
 
 
 @bp.post("/recommendations/<recommendation_id>/accept")

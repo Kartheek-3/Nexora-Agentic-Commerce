@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from uuid import uuid4
+import json
+from datetime import date, datetime
+from decimal import Decimal
+from uuid import UUID, uuid4
 
 from backend.agent.schemas import Intent
 from backend.config import config
@@ -32,6 +35,22 @@ def _safe_exception_metadata(exc: Exception) -> dict:
 def _agent_log(message: str, **metadata) -> None:
     safe = " ".join(f"{key}={value}" for key, value in metadata.items() if value is not None)
     print(f"[agent] {message}{' ' + safe if safe else ''}", flush=True)
+
+
+def _json_safe(value):
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def structure_intent(message: str) -> Intent:
@@ -76,8 +95,8 @@ def run_commerce_agent(message: str) -> dict:
             merchant_id = merchant.get("id") if merchant else None
             if not merchant_id:
                 raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "MERCHANT_NOT_FOUND")
-            session = create_agent_session({"merchant_id": merchant_id, "intent": intent.model_dump(), "status": "active"})
-            agent_session_id = session.get("id")
+            session = create_agent_session({"merchant_id": merchant_id, "intent": intent.model_dump(mode="json"), "status": "active"})
+            agent_session_id = str(session.get("id")) if session.get("id") else None
             if not agent_session_id:
                 raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "AGENT_SESSION_CREATE_FAILED")
             print("[agent] persisted session agent_session_present=True", flush=True)
@@ -127,7 +146,7 @@ def run_commerce_agent(message: str) -> dict:
                         "status": "proposed",
                     }
                 )
-                cross_sell["recommendation_id"] = persisted.get("id")
+                cross_sell["recommendation_id"] = str(persisted.get("id")) if persisted.get("id") else None
                 print(f"[agent] recommendation persistence completed request_id={request_id} recommendation_present={bool(persisted.get('id'))}", flush=True)
             except Exception as exc:
                 _agent_log("recommendation persistence failed", request_id=request_id, **_safe_exception_metadata(exc))
@@ -173,17 +192,27 @@ def run_commerce_agent(message: str) -> dict:
         print(f"[agent] audit persistence completed request_id={request_id}", flush=True)
     except Exception as exc:
         print(f"[agent] audit persistence failed request_id={request_id} exception={type(exc).__name__}", flush=True)
-    print(f"[agent] response ready request_id={request_id}", flush=True)
-    return {
+    print(f"[agent] response assembly starting request_id={request_id}", flush=True)
+    result = {
         "request_id": request_id,
         "agent_session_id": agent_session_id,
-        "structured_intent": {**intent.model_dump(), "budget_max": budget_max, "currency": "INR"},
+        "structured_intent": {**intent.model_dump(mode="json"), "budget_max": budget_max, "currency": "INR"},
         "candidate_count": len(candidates),
         "recommendations": [{"product": item, "score": item["match_score"], "reason": item["match_reasons"][0], "within_budget": budget_max is None or item["price"] <= budget_max} for item in recommendations],
         "cross_sell": [cross_sell] if cross_sell and cross_sell.get("product") else [],
         "constraints": {"category": intent.category, "budget_max": budget_max, "currency": "INR", "available": True},
         "action_lifecycle": ["PROPOSED", "POLICY_CHECK", "AWAITING_APPROVAL"],
     }
+    result = _json_safe(result)
+    print(f"[agent] response assembly completed request_id={request_id}", flush=True)
+    try:
+        json.dumps(result)
+        print(f"[agent] response json validation passed request_id={request_id}", flush=True)
+    except TypeError as exc:
+        print(f"[agent] response not json serializable request_id={request_id} exception={type(exc).__name__} message={str(exc)[:500]}", flush=True)
+        raise
+    print(f"[agent] response ready request_id={request_id}", flush=True)
+    return result
 
 
 def _recommend_session_cross_sell(primary: dict, candidates: list[dict], budget_max: int | None) -> dict | None:
