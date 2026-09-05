@@ -7,6 +7,7 @@ from backend.config import config
 from backend.services.audit_service import record_event
 from backend.services.catalog_service import search_catalog
 from backend.services.llm_service import structure_intent_with_llm
+from backend.services.supabase_service import create_agent_session, fetch_merchant_by_name
 
 
 class AgentPipelineError(RuntimeError):
@@ -50,6 +51,24 @@ def run_commerce_agent(message: str) -> dict:
         print(f"[agent] intent extraction failed request_id={request_id} exception={type(exc).__name__}", flush=True)
         raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "INTENT_EXTRACTION_FAILED") from exc
     print(f"[agent] structured intent ready request_id={request_id} category={intent.category} budget={intent.budget.max if intent.budget else None}", flush=True)
+    agent_session_id = None
+    merchant_id = None
+    if not config.demo_mode:
+        try:
+            merchant = fetch_merchant_by_name("NEXORA Demo Store")
+            merchant_id = merchant.get("id") if merchant else None
+            if not merchant_id:
+                raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "MERCHANT_NOT_FOUND")
+            session = create_agent_session({"merchant_id": merchant_id, "intent": intent.model_dump(), "status": "active"})
+            agent_session_id = session.get("id")
+            if not agent_session_id:
+                raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "AGENT_SESSION_CREATE_FAILED")
+            print("[agent] persisted session agent_session_present=True", flush=True)
+        except AgentPipelineError:
+            raise
+        except Exception as exc:
+            print(f"[agent] session persistence failed request_id={request_id} exception={type(exc).__name__}", flush=True)
+            raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "AGENT_SESSION_CREATE_FAILED") from exc
     budget_max = intent.budget.max if intent.budget else None
     query = " ".join([*(intent.keywords or []), *(intent.preferences or []), intent.category or "", intent.occasion or ""]).strip()
     print(f"[agent] catalog search starting request_id={request_id}", flush=True)
@@ -70,10 +89,10 @@ def run_commerce_agent(message: str) -> dict:
     print(f"[agent] ranking completed request_id={request_id} count={len(recommendations)} skus={recommended_skus}", flush=True)
     print(f"[agent] audit persistence starting request_id={request_id}", flush=True)
     try:
-        record_event("SESSION_STARTED", "Commerce agent session started.", {"request_id": request_id, "risk_level": "LOW"}, actor="customer", action="start_agent_session", session_id=request_id)
-        record_event("INTENT_RECEIVED", "Commerce agent received shopper intent.", {"request_id": request_id, "category": intent.category, "budget_max": budget_max, "risk_level": "LOW"}, actor="customer", action="submit_intent", session_id=request_id)
-        record_event("INTENT_PARSED", "Commerce agent parsed structured buying constraints.", {"request_id": request_id, "structured_intent": intent.model_dump(), "risk_level": "LOW"}, actor="agent", action="parse_intent", session_id=request_id)
-        record_event("CATALOG_SEARCHED", "Commerce agent searched the live catalog.", {"request_id": request_id, "candidate_count": len(candidates), "category": intent.category, "budget_max": budget_max, "active_only": True, "in_stock_only": True, "risk_level": "LOW"}, actor="agent", action="search_catalog", session_id=request_id)
+        record_event("SESSION_STARTED", "Commerce agent session started.", {"request_id": request_id, "risk_level": "LOW"}, actor="customer", action="start_agent_session", session_id=request_id, agent_session_id=agent_session_id, merchant_id=merchant_id)
+        record_event("INTENT_RECEIVED", "Commerce agent received shopper intent.", {"request_id": request_id, "category": intent.category, "budget_max": budget_max, "risk_level": "LOW"}, actor="customer", action="submit_intent", session_id=request_id, agent_session_id=agent_session_id, merchant_id=merchant_id)
+        record_event("INTENT_PARSED", "Commerce agent parsed structured buying constraints.", {"request_id": request_id, "structured_intent": intent.model_dump(), "risk_level": "LOW"}, actor="agent", action="parse_intent", session_id=request_id, agent_session_id=agent_session_id, merchant_id=merchant_id)
+        record_event("CATALOG_SEARCHED", "Commerce agent searched the live catalog.", {"request_id": request_id, "candidate_count": len(candidates), "category": intent.category, "budget_max": budget_max, "active_only": True, "in_stock_only": True, "risk_level": "LOW"}, actor="agent", action="search_catalog", session_id=request_id, agent_session_id=agent_session_id, merchant_id=merchant_id)
         if recommendations:
             record_event(
                 "PRODUCT_RECOMMENDED",
@@ -88,6 +107,8 @@ def run_commerce_agent(message: str) -> dict:
                 actor="agent",
                 action="rank_products",
                 session_id=request_id,
+                agent_session_id=agent_session_id,
+                merchant_id=merchant_id,
             )
         print(f"[agent] audit persistence completed request_id={request_id}", flush=True)
     except Exception as exc:
@@ -95,6 +116,7 @@ def run_commerce_agent(message: str) -> dict:
     print(f"[agent] response ready request_id={request_id}", flush=True)
     return {
         "request_id": request_id,
+        "agent_session_id": agent_session_id,
         "structured_intent": {**intent.model_dump(), "budget_max": budget_max, "currency": "INR"},
         "candidate_count": len(candidates),
         "recommendations": [{"product": item, "score": item["match_score"], "reason": item["match_reasons"][0], "within_budget": budget_max is None or item["price"] <= budget_max} for item in recommendations],

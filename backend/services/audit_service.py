@@ -33,6 +33,7 @@ def record_event(
     actor: str | None = None,
     action: str | None = None,
     session_id: str | None = None,
+    agent_session_id: str | None = None,
     merchant_id: str | None = None,
 ) -> dict[str, Any]:
     metadata = metadata or {}
@@ -49,7 +50,7 @@ def record_event(
         event = create_audit_log(
             {
                 "merchant_id": resolved_merchant_id,
-                "agent_session_id": metadata.get("agent_session_id"),
+                "agent_session_id": agent_session_id or metadata.get("agent_session_id"),
                 "actor_type": actor or metadata.get("actor_type", "system"),
                 "actor_id": metadata.get("actor_id"),
                 "event_type": event_type,
@@ -75,6 +76,7 @@ def record_event(
         "risk_level": metadata.get("risk_level", "LOW") if metadata else "LOW",
         "authorization_status": metadata.get("authorization_status", "NOT_REQUIRED") if metadata else "NOT_REQUIRED",
         "status": status,
+        "agent_session_id": agent_session_id or metadata.get("agent_session_id"),
         "metadata": metadata,
     }
     AUDIT_LOGS.append(event)

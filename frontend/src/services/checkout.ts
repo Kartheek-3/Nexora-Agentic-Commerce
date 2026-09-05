@@ -21,14 +21,14 @@ export type CheckoutAuthorization = {
   idempotent_replay?: boolean;
 };
 
-export async function authorizeCheckout(cartId: string, idempotencyKey: string) {
+export async function authorizeCheckout(cartId: string, idempotencyKey: string, agentSessionId?: string | null) {
   console.log("[checkout] authorization request starting");
-  const response = await api.post<{ data: CheckoutAuthorization }>("/checkout/authorize", { cart_id: cartId, idempotency_key: idempotencyKey });
+  const response = await api.post<{ data: CheckoutAuthorization }>("/checkout/authorize", { cart_id: cartId, idempotency_key: idempotencyKey, agent_session_id: agentSessionId || undefined });
   return response.data.data;
 }
 
-export async function createCheckoutOrder(cartId: string, idempotencyKey: string, agentActionId?: string) {
-  const response = await api.post<{ data: CheckoutOrder }>("/checkout/create-order", { cart_id: cartId, idempotency_key: idempotencyKey, agent_action_id: agentActionId });
+export async function createCheckoutOrder(cartId: string, idempotencyKey: string, agentActionId?: string, agentSessionId?: string | null) {
+  const response = await api.post<{ data: CheckoutOrder }>("/checkout/create-order", { cart_id: cartId, idempotency_key: idempotencyKey, agent_action_id: agentActionId, agent_session_id: agentSessionId || undefined });
   return response.data.data;
 }
 

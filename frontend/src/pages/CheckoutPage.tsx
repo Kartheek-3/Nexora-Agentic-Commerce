@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { AuthorizationPanel } from "../components/checkout/AuthorizationPanel";
 import { products } from "../data/demo";
 import { authorizeCheckout, createCheckoutOrder, recordCheckoutFailure, verifyCheckoutPayment, type CheckoutOrder } from "../services/checkout";
@@ -69,6 +69,10 @@ function checkoutErrorMessage(error: unknown) {
 
 export default function CheckoutPage() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const locationState = location.state as { agentSessionId?: string } | null;
+  const agentSessionId = locationState?.agentSessionId || sessionStorage.getItem("nexora_agent_session_id");
+  const idempotencyKey = agentSessionId ? `nexora_checkout_${agentSessionId}` : "demo_birthday_checkout";
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const paymentCompletedRef = useRef(false);
@@ -91,10 +95,10 @@ export default function CheckoutPage() {
     let order: CheckoutOrder | null = null;
     try {
       setMessage("Recording checkout authorization...");
-      const authorization = await authorizeCheckout("demo_cart_birthday", "demo_birthday_checkout");
+      const authorization = await authorizeCheckout("demo_cart_birthday", idempotencyKey, agentSessionId);
       console.log("[checkout] creating order");
       setMessage("Creating Razorpay test order...");
-      order = await createCheckoutOrder(authorization.cart_id, "demo_birthday_checkout", authorization.authorization_id);
+      order = await createCheckoutOrder(authorization.cart_id, idempotencyKey, authorization.authorization_id, agentSessionId);
       console.log("[checkout] order created", { orderId: order.order_id, amount: order.amount, currency: order.currency });
       const orderIdValid = order.order_id.startsWith("order_");
       const amountValid = order.amount === 369800;

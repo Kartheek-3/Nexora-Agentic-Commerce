@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
@@ -29,12 +31,14 @@ class CheckoutRequest(BaseModel):
     cart_id: str
     idempotency_key: str = Field(min_length=12)
     agent_action_id: str | None = None
+    agent_session_id: UUID | None = None
 
 
 class AuthorizeCheckoutRequest(BaseModel):
     cart_id: str
     idempotency_key: str = Field(min_length=12)
     agent_action_id: str | None = None
+    agent_session_id: UUID | None = None
 
 
 class VerifyPaymentRequest(BaseModel):

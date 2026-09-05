@@ -25,6 +25,7 @@ from backend.services.supabase_service import (
     fetch_order_by_razorpay_id,
     fetch_payment_by_razorpay_id,
     fetch_profile_by_firebase_uid,
+    fetch_agent_session,
     fetch_products_by_skus,
     get_supabase_client,
     update_agent_action,
@@ -137,6 +138,16 @@ def _is_uuid(value: str) -> bool:
 
 def _inr_to_paise(amount_inr: int) -> int:
     return int(amount_inr) * 100
+
+
+def _validated_agent_session_id(agent_session_id: str | None) -> str | None:
+    if not agent_session_id:
+        return None
+    if not _is_uuid(agent_session_id):
+        raise CheckoutError("Agent session id is invalid.", 422, "AGENT_SESSION_INVALID")
+    if not fetch_agent_session(agent_session_id):
+        raise CheckoutError("Agent session could not be found.", 404, "AGENT_SESSION_NOT_FOUND")
+    return agent_session_id
 
 
 def _audit(event_type: str, description: str, status: str, metadata: dict[str, Any]) -> None:
@@ -318,7 +329,7 @@ def _resolve_checkout_cart(cart_id: str, idempotency_key: str, firebase_uid: str
     return cart["id"]
 
 
-def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None) -> dict:
+def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None) -> dict:
     timer = AuthorizeTimer()
     timer.mark("request received", cart_id=cart_id, idempotency_key_present=bool(idempotency_key))
     if config.demo_mode:
@@ -330,6 +341,8 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
         return {"authorization_id": idempotency_key, "status": "approved", "cart_id": cart_id, "amount": _inr_to_paise(total), "currency": "INR"}
     if get_supabase_client() is None:
         raise CheckoutError("Supabase is not configured.", 502, "SUPABASE_UNAVAILABLE")
+    agent_session_id = _validated_agent_session_id(agent_session_id)
+    timer.mark("agent session linked", linked=bool(agent_session_id))
 
     timer.mark("firebase verified", uid_present=bool(firebase_uid))
     timer.mark("resolving cart")
@@ -375,12 +388,19 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
     timer.mark("agent action lookup completed")
     timer.mark("existing action found", found=bool(existing))
     if existing:
+        existing_session_id = existing.get("agent_session_id")
+        if existing_session_id and agent_session_id and existing_session_id != agent_session_id:
+            raise CheckoutError("Authorization belongs to a different agent session.", 409, "AGENT_SESSION_MISMATCH")
         requested = existing.get("requested_payload") or {}
         if existing.get("user_id") and existing["user_id"] != profile["id"]:
             raise CheckoutError("Authorization does not belong to this user.", 403, "AUTHORIZATION_USER_MISMATCH")
         if requested.get("cart_id") and requested["cart_id"] != resolved_cart_id:
             raise CheckoutError("Authorization does not match this cart.", 409, "AUTHORIZATION_CART_MISMATCH")
         if str(existing.get("approval_status", "")).upper() == "APPROVED":
+            if not existing_session_id and agent_session_id:
+                update_agent_action(existing["id"], {"agent_session_id": agent_session_id, "updated_at": _now()})
+                existing["agent_session_id"] = agent_session_id
+                _authorize_log("authorization session linked", linked=True)
             timer.summary()
             return {"authorization_id": existing["id"], "status": "approved", "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "idempotent_replay": True}
         timer.mark("persisting agent action", action_id=existing["id"])
@@ -390,6 +410,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
                     existing["id"],
                     {
                         "approval_status": "APPROVED",
+                        "agent_session_id": existing_session_id or agent_session_id,
                         "approved_by": profile["id"],
                         "approved_at": _now(),
                         "execution_status": "APPROVED",
@@ -402,7 +423,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
             raise CheckoutError("Checkout authorization could not be recorded.", 502, "AGENT_ACTION_UPDATE_FAILED") from exc
         timer.mark("authorization persisted", authorization_id=updated.get("id", existing["id"]))
         with timer.stage("audit persistence"):
-            _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "checkout_request_id": existing["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
+            _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": existing_session_id or agent_session_id, "checkout_request_id": existing["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
         timer.mark("returning response", authorization_id=updated.get("id", existing["id"]))
         timer.summary()
         return {"authorization_id": updated.get("id", existing["id"]), "status": "approved", "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "idempotent_replay": True}
@@ -412,9 +433,9 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
         with timer.stage("agent action persistence"):
             action = create_agent_action(
                 {
-                    "agent_session_id": None,
                     "user_id": profile["id"],
                     "merchant_id": cart["merchant_id"],
+                    "agent_session_id": agent_session_id,
                     "action_type": "create_order",
                     "requested_payload": {"cart_id": resolved_cart_id, "source_cart_id": cart_id},
                     "decision_summary": "Customer approved birthday gift checkout.",
@@ -434,16 +455,17 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
     if not action.get("id"):
         raise CheckoutError("Checkout authorization could not be recorded.", 422, "AUTHORIZATION_NOT_READY")
     timer.mark("authorization persisted", authorization_id=action["id"])
+    timer.mark("authorization session linked", linked=bool(agent_session_id))
     with timer.stage("audit persistence"):
-        _audit("CART_PREPARED", "Checkout cart prepared from trusted Supabase products.", "COMPLETED", {"merchant_id": cart["merchant_id"], "checkout_request_id": action["id"], "cart_id": resolved_cart_id, "item_count": len(items), "amount_inr": total, "amount": amount_paise, "currency": "INR", "authorization_status": "REQUIRED"})
-        _audit("POLICY_CHECK_PASSED", policy["decision_summary"], "COMPLETED", {"merchant_id": cart["merchant_id"], "checkout_request_id": action["id"], "risk_level": policy["risk_level"], "authorization_status": "APPROVED", "amount": total, "maximum_allowed": 10000, "decision": policy.get("decision")})
-        _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "checkout_request_id": action["id"], "authorization_id": action["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
+        _audit("CART_PREPARED", "Checkout cart prepared from trusted Supabase products.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "cart_id": resolved_cart_id, "item_count": len(items), "amount_inr": total, "amount": amount_paise, "currency": "INR", "authorization_status": "REQUIRED"})
+        _audit("POLICY_CHECK_PASSED", policy["decision_summary"], "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "risk_level": policy["risk_level"], "authorization_status": "APPROVED", "amount": total, "maximum_allowed": 10000, "decision": policy.get("decision")})
+        _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "authorization_id": action["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
     timer.mark("returning response", authorization_id=action["id"])
     timer.summary()
     return {"authorization_id": action["id"], "status": "approved", "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "idempotent_replay": False}
 
 
-def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None) -> dict:
+def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None) -> dict:
     _safe_log("request received", cart_id=cart_id, idempotency_key=idempotency_key)
     if config.demo_mode:
         cart = DEMO_CARTS.get(cart_id)
@@ -460,6 +482,8 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
         raise CheckoutError("Razorpay live keys are disabled for this development flow.", 503, "RAZORPAY_CONFIGURATION_ERROR")
     if get_supabase_client() is None:
         raise CheckoutError("Supabase is not configured.", 502, "SUPABASE_UNAVAILABLE")
+    agent_session_id = _validated_agent_session_id(agent_session_id)
+    _safe_log("agent session linked", linked=bool(agent_session_id))
 
     _safe_log("firebase authenticated", uid_present=bool(firebase_uid))
     _safe_log("resolving idempotency")
@@ -471,6 +495,13 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
 
     _safe_log("validating authorization")
     action = _approved_action(agent_action_id, idempotency_key, firebase_uid, resolved_cart_id, email)
+    action_session_id = action.get("agent_session_id")
+    if agent_session_id and action_session_id and action_session_id != agent_session_id:
+        raise CheckoutError("Checkout authorization belongs to a different agent session.", 409, "AGENT_SESSION_MISMATCH")
+    if agent_session_id and not action_session_id:
+        action = update_agent_action(action["id"], {"agent_session_id": agent_session_id, "updated_at": _now()}) or action
+        action_session_id = agent_session_id
+    _safe_log("authorization session linked", linked=bool(action_session_id))
     _safe_log("authorization valid", action_id=action.get("id"))
     checkout_request_id = action["id"]
     result = action.get("execution_result") or {}
@@ -490,7 +521,7 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
     _safe_log("validating guardrails")
     policy = check_checkout(total)
     if not policy["passed"]:
-        _audit("POLICY_CHECK_BLOCKED", policy["decision_summary"], "FAILED", {"merchant_id": cart["merchant_id"], "agent_session_id": action.get("agent_session_id"), "risk_level": policy["risk_level"], "authorization_status": "APPROVED", "amount": total})
+        _audit("POLICY_CHECK_BLOCKED", policy["decision_summary"], "FAILED", {"merchant_id": cart["merchant_id"], "agent_session_id": action_session_id, "risk_level": policy["risk_level"], "authorization_status": "APPROVED", "amount": total})
         raise CheckoutError(policy["decision_summary"], 403, "POLICY_BLOCKED")
     _safe_log("guardrails passed")
 
@@ -523,8 +554,8 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
     order_row = create_order_record({"merchant_id": cart["merchant_id"], "customer_id": cart.get("customer_id"), "cart_session_id": resolved_cart_id, "razorpay_order_id": order["id"], "total_inr": total, "status": "payment_pending"})
     create_order_item_records([{"order_id": order_row["id"], "product_id": item["product"]["id"], "quantity": item["quantity"], "unit_price_inr": item["unit_price_inr"]} for item in items])
     update_agent_action(checkout_request_id, {"execution_status": "PAYMENT_PENDING", "execution_result": {"checkout_request_id": checkout_request_id, "razorpay_order_id": order["id"], "amount": amount_paise, "currency": "INR", "order_db_id": order_row["id"], "updated_at": _now()}})
-    _audit("RAZORPAY_ORDER_CREATED", "Razorpay test order created.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": action.get("agent_session_id"), "checkout_request_id": checkout_request_id, "razorpay_order_id": order["id"], "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "razorpay"})
-    _audit("PAYMENT_ATTEMPTED", "Payment moved to Razorpay Checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": action.get("agent_session_id"), "checkout_request_id": checkout_request_id, "order_id": order["id"], "authorization_status": "APPROVED"})
+    _audit("RAZORPAY_ORDER_CREATED", "Razorpay test order created.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": action_session_id, "checkout_request_id": checkout_request_id, "razorpay_order_id": order["id"], "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "razorpay"})
+    _audit("PAYMENT_ATTEMPTED", "Payment moved to Razorpay Checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": action_session_id, "checkout_request_id": checkout_request_id, "order_id": order["id"], "authorization_status": "APPROVED"})
     _razorpay_response_log(order["id"], amount_paise, "INR")
     _safe_log("returning create-order response", checkout_request_id=checkout_request_id)
     return {"checkout_request_id": checkout_request_id, "order_id": order["id"], "amount": amount_paise, "amount_inr": total, "currency": "INR", "key_id": config.razorpay_key_id, "idempotent_replay": False}
@@ -560,5 +591,6 @@ def verify_checkout_payment(checkout_request_id: str | None, razorpay_order_id: 
     create_payment_record({"order_id": order_row["id"], "razorpay_payment_id": razorpay_payment_id, "razorpay_order_id": razorpay_order_id, "amount_inr": order_row["total_inr"], "status": "verified", "raw_payload": {"checkout_request_id": checkout_request_id, "provider_status": payment.get("status")}})
     update_order_by_razorpay_id(razorpay_order_id, {"status": "verified", "updated_at": _now()})
     update_agent_action(checkout_request_id, {"execution_status": "PAYMENT_VERIFIED", "execution_result": {**result, "payment_id": razorpay_payment_id, "verified_at": _now()}})
+    _safe_log("payment attribution session linked", linked=bool(action.get("agent_session_id")))
     _audit("PAYMENT_VERIFIED", "Payment signature verified and persisted.", "COMPLETED", {"merchant_id": action.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "checkout_request_id": checkout_request_id, "razorpay_order_id": razorpay_order_id, "razorpay_payment_id": razorpay_payment_id, "amount": order_row["total_inr"], "currency": "INR", "authorization_status": "APPROVED", "actor_type": "razorpay"})
     return {"verified": True, "status": "verified", "checkout_request_id": checkout_request_id, "order_id": razorpay_order_id, "payment_id": razorpay_payment_id}

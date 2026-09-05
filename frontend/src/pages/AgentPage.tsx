@@ -103,7 +103,12 @@ export default function AgentPage({ merchant = false }: { merchant?: boolean }) 
   };
 
   const continueToCheckout = () => {
-    navigate("/checkout");
+    if (!agentResult?.agent_session_id) {
+      navigate("/checkout");
+      return;
+    }
+    sessionStorage.setItem("nexora_agent_session_id", agentResult.agent_session_id);
+    navigate("/checkout", { state: { agentSessionId: agentResult.agent_session_id } });
   };
 
   const runEvalSuite = async () => {

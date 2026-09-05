@@ -9,6 +9,7 @@ export async function searchAgentCatalog(query: string): Promise<Product[]> {
 
 export type AgentRunResponse = {
   request_id: string;
+  agent_session_id: string | null;
   structured_intent: Record<string, unknown>;
   candidate_count: number;
   recommendations: Array<{ product: Product; score: number; reason: string; within_budget: boolean }>;

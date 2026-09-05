@@ -103,6 +103,21 @@ def fetch_merchant_by_name(name: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def create_agent_session(values: dict) -> dict:
+    client = get_supabase_client()
+    response = client.table("agent_sessions").insert(values).execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_agent_session(session_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("agent_sessions").select("*").eq("id", session_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
 def fetch_product_by_sku(sku: str) -> dict | None:
     client = get_supabase_client()
     if client is None:

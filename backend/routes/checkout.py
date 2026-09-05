@@ -25,7 +25,8 @@ def authorize_checkout():
     except ValidationError as exc:
         return fail(exc.errors()[0]["msg"], 422, "VALIDATION_ERROR")
     try:
-        return ok(authorize_checkout_service(payload.cart_id, payload.idempotency_key, g.user["uid"], payload.agent_action_id, g.user.get("email")))
+        agent_session_id = str(payload.agent_session_id) if payload.agent_session_id else None
+        return ok(authorize_checkout_service(payload.cart_id, payload.idempotency_key, g.user["uid"], payload.agent_action_id, g.user.get("email"), agent_session_id))
     except CheckoutError as exc:
         record_event(exc.code, str(exc), {"cart_id": payload.cart_id, "risk_level": "MEDIUM"}, "FAILED")
         return fail(str(exc), exc.status, exc.code)
@@ -43,7 +44,8 @@ def create_checkout_order():
     except ValidationError as exc:
         return fail(exc.errors()[0]["msg"], 422, "VALIDATION_ERROR")
     try:
-        return ok(create_checkout_order_service(payload.cart_id, payload.idempotency_key, g.user["uid"], payload.agent_action_id, g.user.get("email")))
+        agent_session_id = str(payload.agent_session_id) if payload.agent_session_id else None
+        return ok(create_checkout_order_service(payload.cart_id, payload.idempotency_key, g.user["uid"], payload.agent_action_id, g.user.get("email"), agent_session_id))
     except CheckoutError as exc:
         record_event(exc.code, str(exc), {"cart_id": payload.cart_id, "risk_level": "MEDIUM"}, "FAILED")
         return fail(str(exc), exc.status, exc.code)
