@@ -9,7 +9,7 @@ from typing import Any
 from backend.config import config
 from backend.services.event_service import publish_event
 from backend.services.guardrail_service import check_checkout
-from backend.services.razorpay_service import create_order, fetch_order, fetch_payment, verify_payment_signature
+from backend.services.razorpay_service import create_order, fetch_order, fetch_payment, razorpay_readiness_metadata, verify_payment_signature
 from backend.services.supabase_service import (
     create_agent_action,
     create_audit_log,
@@ -102,6 +102,26 @@ def _safe_exception_metadata(exc: Exception) -> dict[str, Any]:
     message = getattr(exc, "message", None)
     if message:
         metadata["message"] = str(message)[:160]
+    return metadata
+
+
+def _safe_provider_exception_metadata(exc: Exception) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "exception": type(exc).__name__,
+        "message": str(exc)[:300],
+    }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(exc, "status", None)
+    if status_code is not None:
+        metadata["status_code"] = status_code
+
+    error = getattr(exc, "error", None)
+    if isinstance(error, dict):
+        if error.get("code"):
+            metadata["provider_code"] = error.get("code")
+        if error.get("description"):
+            metadata["provider_description"] = str(error.get("description"))[:300]
     return metadata
 
 
@@ -474,11 +494,12 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
 
     amount_paise = _inr_to_paise(total)
     _safe_log("persisting checkout request", checkout_request_id=checkout_request_id)
+    _safe_log("Razorpay readiness", **razorpay_readiness_metadata(amount_paise, "INR"))
     _safe_log("creating Razorpay order", amount=amount_paise, currency="INR")
     try:
         order = create_order(amount_paise, "INR", checkout_request_id, idempotency_key)
     except Exception as exc:
-        _safe_log("Razorpay create order failed", exception=type(exc).__name__)
+        _safe_log("Razorpay create order failed", **_safe_provider_exception_metadata(exc))
         raise CheckoutError("Razorpay order could not be created.", 502, "RAZORPAY_PROVIDER_ERROR") from exc
     order_id = str(order.get("id") or "")
     order_status = str(order.get("status") or "")

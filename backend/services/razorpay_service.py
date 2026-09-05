@@ -15,6 +15,18 @@ def _key_fingerprint() -> str:
     return f"{config.razorpay_key_id[:8]}...{config.razorpay_key_id[-4:]}"
 
 
+def razorpay_readiness_metadata(amount_paise: int, currency: str) -> dict[str, Any]:
+    return {
+        "key_id_present": bool(config.razorpay_key_id),
+        "key_id_mode": "test" if config.razorpay_key_id.startswith("rzp_test_") else "invalid",
+        "key_fingerprint": _key_fingerprint(),
+        "secret_present": bool(config.razorpay_key_secret),
+        "demo_mode": config.demo_mode,
+        "amount": amount_paise,
+        "currency": currency,
+    }
+
+
 def _client():
     import razorpay
 
