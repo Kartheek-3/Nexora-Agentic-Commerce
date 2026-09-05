@@ -2,6 +2,8 @@
 
 NEXORA is an AI-native commerce application built for the Razorpay Buildathon. It turns natural-language shopper intent into real catalog recommendations, explicit human authorization, Razorpay test checkout, server-side payment verification, and an auditable merchant control layer.
 
+Live demo: https://nexora-agentic-commerce-infrastructure-2e4u638ru.vercel.app/
+
 The core principle is simple:
 
 ```text
