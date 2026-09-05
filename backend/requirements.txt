@@ -2,6 +2,8 @@ Flask==3.0.3
 Flask-Cors==4.0.1
 pydantic==2.8.2
 python-dotenv==1.0.1
+requests>=2.31.0
+setuptools>=70.0.0
 supabase==2.7.4
 firebase-admin==6.5.0
 razorpay==1.4.2

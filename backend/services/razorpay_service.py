@@ -28,7 +28,11 @@ def razorpay_readiness_metadata(amount_paise: int, currency: str) -> dict[str, A
 
 
 def _client():
-    import razorpay
+    try:
+        import razorpay
+    except ModuleNotFoundError as exc:
+        print(f"[razorpay] SDK import failed missing_module={exc.name}", flush=True)
+        raise
 
     return razorpay.Client(auth=(config.razorpay_key_id, config.razorpay_key_secret))
 

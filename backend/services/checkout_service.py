@@ -110,6 +110,8 @@ def _safe_provider_exception_metadata(exc: Exception) -> dict[str, Any]:
         "exception": type(exc).__name__,
         "message": str(exc)[:300],
     }
+    if isinstance(exc, ModuleNotFoundError):
+        metadata["missing_module"] = exc.name
     status_code = getattr(exc, "status_code", None)
     if status_code is None:
         status_code = getattr(exc, "status", None)
@@ -476,7 +478,7 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
         try:
             current_order = fetch_order(result["razorpay_order_id"])
         except Exception as exc:
-            _safe_log("Razorpay replay order fetch failed", exception=type(exc).__name__)
+            _safe_log("Razorpay replay order fetch failed", **_safe_provider_exception_metadata(exc))
             current_order = {}
         current_status = str(current_order.get("status") or "")
         if current_status in {"created", "attempted"}:
