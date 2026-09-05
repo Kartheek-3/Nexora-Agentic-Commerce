@@ -28,6 +28,8 @@ def create_app() -> Flask:
             r"/api/*": {
                 "origins": [
                     config.frontend_url,
+                    "https://nexora-agentic-commerce-nu.vercel.app",
+                    "https://nexora-anwg1h8ya-kartheeks-projects-640e3f8b.vercel.app",
                     r"https://nexora-.*\.vercel\.app",
                     "http://127.0.0.1:5173",
                     "http://localhost:5173",
