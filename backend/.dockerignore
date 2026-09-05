@@ -1,0 +1,15 @@
+.env
+.env.*
+venv
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+tests
+node_modules
+dist
+build
+test-results
+playwright-report

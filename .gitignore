@@ -6,6 +6,8 @@ frontend/.env
 node_modules/
 .venv/
 __pycache__/
+*.pyc
+venv/
 .npm-cache/
 dist/
 test-results/

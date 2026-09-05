@@ -6,3 +6,4 @@ supabase==2.7.4
 firebase-admin==6.5.0
 razorpay==1.4.2
 openai==1.42.0
+gunicorn==23.0.0
