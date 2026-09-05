@@ -1,0 +1,11 @@
+{
+  "name": "nexora-buildathon",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "typecheck": "npm --prefix frontend run typecheck",
+    "lint": "npm --prefix frontend run lint",
+    "backend": "flask --app backend.app run --debug --port 5000"
+  }
+}

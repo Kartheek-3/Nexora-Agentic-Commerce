@@ -1,0 +1,8 @@
+Flask==3.0.3
+Flask-Cors==4.0.1
+pydantic==2.8.2
+python-dotenv==1.0.1
+supabase==2.7.4
+firebase-admin==6.5.0
+razorpay==1.4.2
+openai==1.42.0

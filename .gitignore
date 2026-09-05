@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+node_modules/
+.venv/
+__pycache__/
+.npm-cache/
+dist/
+test-results/
+playwright-report/
+playwright/.auth/
+frontend/test-results/
+frontend/playwright-report/
+frontend/playwright/.auth/
