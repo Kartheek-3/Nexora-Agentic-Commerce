@@ -82,6 +82,19 @@ def _normalize_intent(message: str, intent: Intent) -> Intent:
     )
 
 
+def _provider_status(exc: Exception) -> int | None:
+    return getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def _log_llm_fallback(exc: Exception, retry: bool = False) -> None:
+    status = _provider_status(exc)
+    prefix = "llm retry failed" if retry else "llm extraction failed"
+    print(f"[agent] {prefix} exception={type(exc).__name__} status={status} model={config.ai_model}", flush=True)
+    if status == 402:
+        print("[agent] llm unavailable status=402 reason=provider_billing_or_quota fallback=true", flush=True)
+    print("[agent] deterministic fallback used=true", flush=True)
+
+
 def structure_intent_with_llm(message: str) -> Intent:
     if not config.ai_api_key:
         print("[agent] deterministic fallback used=true reason=missing_ai_key", flush=True)
@@ -97,9 +110,7 @@ def structure_intent_with_llm(message: str) -> Intent:
     try:
         response = client.chat.completions.create(model=config.ai_model, response_format={"type": "json_object"}, messages=messages)
     except Exception as exc:
-        status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-        print(f"[agent] llm extraction failed exception={type(exc).__name__} status={status} model={config.ai_model}", flush=True)
-        print("[agent] deterministic fallback used=true", flush=True)
+        _log_llm_fallback(exc)
         return _fallback_intent(message)
     content = response.choices[0].message.content or "{}"
     try:
@@ -116,9 +127,7 @@ def structure_intent_with_llm(message: str) -> Intent:
                 ],
             )
         except Exception as exc:
-            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-            print(f"[agent] llm retry failed exception={type(exc).__name__} status={status} model={config.ai_model}", flush=True)
-            print("[agent] deterministic fallback used=true", flush=True)
+            _log_llm_fallback(exc, retry=True)
             return _fallback_intent(message)
         try:
             print("[agent] LLM intent extraction succeeded", flush=True)

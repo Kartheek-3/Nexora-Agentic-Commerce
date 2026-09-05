@@ -17,6 +17,23 @@ class AgentPipelineError(RuntimeError):
         self.status = status
 
 
+def _safe_exception_metadata(exc: Exception) -> dict:
+    metadata = {
+        "exception": type(exc).__name__,
+        "message": str(exc)[:500],
+    }
+    for name in ("code", "details", "hint"):
+        value = getattr(exc, name, None)
+        if value:
+            metadata[name] = str(value)[:500]
+    return metadata
+
+
+def _agent_log(message: str, **metadata) -> None:
+    safe = " ".join(f"{key}={value}" for key, value in metadata.items() if value is not None)
+    print(f"[agent] {message}{' ' + safe if safe else ''}", flush=True)
+
+
 def structure_intent(message: str) -> Intent:
     if not config.demo_mode:
         return structure_intent_with_llm(message)
@@ -83,25 +100,37 @@ def run_commerce_agent(message: str) -> dict:
         recommendations = [item for item in candidates if item.get("availability") and (budget_max is None or item.get("price", 0) <= budget_max)][:3]
         recommended_skus = [item.get("sku") or item.get("id") for item in recommendations]
         cross_sell = _recommend_session_cross_sell(recommendations[0], candidates, budget_max) if recommendations else None
-        if cross_sell and agent_session_id:
-            product = cross_sell.get("product") or {}
-            product_id = product.get("database_id") or product.get("id")
-            if product_id:
+    except Exception as exc:
+        print(f"[agent] ranking failed request_id={request_id} exception={type(exc).__name__}", flush=True)
+        raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "RANKING_FAILED") from exc
+    print(f"[agent] ranking completed request_id={request_id} count={len(recommendations)} skus={recommended_skus}", flush=True)
+    if cross_sell and agent_session_id:
+        print(f"[agent] recommendation persistence starting request_id={request_id}", flush=True)
+        product = cross_sell.get("product") or {}
+        product_id = product.get("database_id")
+        decision_summary = str(cross_sell.get("decision_summary") or "").strip()
+        confidence = float(product.get("match_score") or 0)
+        if not product_id:
+            print(f"[agent] recommendation persistence skipped request_id={request_id} reason=missing_database_product_id", flush=True)
+        elif not decision_summary:
+            print(f"[agent] recommendation persistence skipped request_id={request_id} reason=missing_decision_summary", flush=True)
+        else:
+            try:
+                # Requires migration 006_revenue_attribution.sql for status/realization columns.
                 persisted = create_recommendation(
                     {
                         "agent_session_id": agent_session_id,
                         "product_id": product_id,
                         "recommendation_type": "cross_sell",
-                        "decision_summary": cross_sell.get("decision_summary"),
-                        "confidence": product.get("match_score"),
+                        "decision_summary": decision_summary,
+                        "confidence": confidence,
                         "status": "proposed",
                     }
                 )
                 cross_sell["recommendation_id"] = persisted.get("id")
-    except Exception as exc:
-        print(f"[agent] ranking failed request_id={request_id} exception={type(exc).__name__}", flush=True)
-        raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "RANKING_FAILED") from exc
-    print(f"[agent] ranking completed request_id={request_id} count={len(recommendations)} skus={recommended_skus}", flush=True)
+                print(f"[agent] recommendation persistence completed request_id={request_id} recommendation_present={bool(persisted.get('id'))}", flush=True)
+            except Exception as exc:
+                _agent_log("recommendation persistence failed", request_id=request_id, **_safe_exception_metadata(exc))
     print(f"[agent] audit persistence starting request_id={request_id}", flush=True)
     try:
         record_event("SESSION_STARTED", "Commerce agent session started.", {"request_id": request_id, "risk_level": "LOW"}, actor="customer", action="start_agent_session", session_id=request_id, agent_session_id=agent_session_id, merchant_id=merchant_id)
