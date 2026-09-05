@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from backend.config import config
 
 _supabase_client = None
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def get_supabase_client():
@@ -118,6 +124,74 @@ def fetch_agent_session(session_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def create_recommendation(values: dict) -> dict:
+    client = get_supabase_client()
+    response = client.table("recommendations").insert(values).execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_recommendation(recommendation_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("recommendations").select("*, products(*)").eq("id", recommendation_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def accept_recommendation(recommendation_id: str, accepted_price_inr: int) -> dict:
+    client = get_supabase_client()
+    response = (
+        client.table("recommendations")
+        .update({"status": "accepted", "accepted_at": _now(), "accepted_price_inr": accepted_price_inr})
+        .eq("id", recommendation_id)
+        .in_("status", ["proposed", "accepted"])
+        .execute()
+    )
+    return (response.data or [{}])[0]
+
+
+def decline_recommendation(recommendation_id: str) -> dict:
+    client = get_supabase_client()
+    response = client.table("recommendations").update({"status": "declined"}).eq("id", recommendation_id).eq("status", "proposed").execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_accepted_recommendations_for_session(agent_session_id: str) -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    response = (
+        client.table("recommendations")
+        .select("*")
+        .eq("agent_session_id", agent_session_id)
+        .eq("recommendation_type", "cross_sell")
+        .eq("status", "accepted")
+        .execute()
+    )
+    return response.data or []
+
+
+def mark_recommendation_realized(recommendation_id: str, order_id: str, payment_id: str, revenue_inr: int) -> dict:
+    client = get_supabase_client()
+    response = (
+        client.table("recommendations")
+        .update({"status": "realized", "realized_order_id": order_id, "realized_payment_id": payment_id, "realized_revenue_inr": revenue_inr})
+        .eq("id", recommendation_id)
+        .eq("status", "accepted")
+        .execute()
+    )
+    return (response.data or [{}])[0]
+
+
+def fetch_realized_upsells(limit: int = 1000) -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    response = client.table("recommendations").select("*").eq("recommendation_type", "cross_sell").eq("status", "realized").limit(limit).execute()
+    return response.data or []
+
+
 def fetch_product_by_sku(sku: str) -> dict | None:
     client = get_supabase_client()
     if client is None:
@@ -183,6 +257,15 @@ def fetch_agent_action(action_id: str | None = None, idempotency_key: str | None
     else:
         return None
     response = query.limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def fetch_agent_action_by_razorpay_order(razorpay_order_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("agent_actions").select("*").filter("execution_result->>razorpay_order_id", "eq", razorpay_order_id).limit(1).execute()
     rows = response.data or []
     return rows[0] if rows else None
 
@@ -258,6 +341,14 @@ def create_order_item_records(values: list[dict]) -> list[dict]:
     return response.data or []
 
 
+def fetch_order_items(order_id: str) -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    response = client.table("order_items").select("*").eq("order_id", order_id).execute()
+    return response.data or []
+
+
 def create_audit_log(values: dict) -> dict:
     client = get_supabase_client()
     response = client.table("audit_logs").insert(values).execute()
@@ -329,4 +420,89 @@ def fetch_agent_verified_payment_events(limit: int = 1000) -> list[dict]:
         .limit(limit)
         .execute()
     )
+    return response.data or []
+
+
+def create_recovery_attempt(values: dict) -> dict:
+    client = get_supabase_client()
+    response = client.table("recovery_attempts").insert(values).execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_recovery_by_original_order(order_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("recovery_attempts").select("*").eq("original_order_id", order_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def fetch_pending_recovery_for_cart(cart_session_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("recovery_attempts").select("*").eq("cart_session_id", cart_session_id).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def complete_recovery_attempt(recovery_id: str, values: dict) -> dict:
+    client = get_supabase_client()
+    response = client.table("recovery_attempts").update({"status": "completed", **values}).eq("id", recovery_id).eq("status", "pending").execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_completed_recoveries(limit: int = 1000) -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    response = client.table("recovery_attempts").select("*").eq("status", "completed").limit(limit).execute()
+    return response.data or []
+
+
+def create_checkout_funnel(values: dict) -> dict:
+    client = get_supabase_client()
+    existing = fetch_checkout_funnel(values["funnel_key"])
+    if existing:
+        return existing
+    response = client.table("checkout_funnel_sessions").insert(values).execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_checkout_funnel(funnel_key: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("checkout_funnel_sessions").select("*").eq("funnel_key", funnel_key).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def fetch_checkout_funnel_by_id(funnel_id: str) -> dict | None:
+    client = get_supabase_client()
+    if client is None:
+        return None
+    response = client.table("checkout_funnel_sessions").select("*").eq("id", funnel_id).limit(1).execute()
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def convert_checkout_funnel(funnel_id: str) -> dict:
+    client = get_supabase_client()
+    response = client.table("checkout_funnel_sessions").update({"status": "converted", "converted_at": _now()}).eq("id", funnel_id).neq("status", "converted").execute()
+    return (response.data or [{}])[0]
+
+
+def abandon_checkout_funnel(funnel_id: str) -> dict:
+    client = get_supabase_client()
+    response = client.table("checkout_funnel_sessions").update({"status": "abandoned", "abandoned_at": _now()}).eq("id", funnel_id).eq("status", "started").execute()
+    return (response.data or [{}])[0]
+
+
+def fetch_checkout_funnel_stats() -> list[dict]:
+    client = get_supabase_client()
+    if client is None:
+        return []
+    response = client.table("checkout_funnel_sessions").select("channel,status").execute()
     return response.data or []

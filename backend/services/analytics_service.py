@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from backend.config import config
-from backend.services.supabase_service import fetch_agent_payment_links, fetch_agent_sessions_count, fetch_agent_verified_payment_events, fetch_verified_payments
+from backend.services.supabase_service import fetch_agent_payment_links, fetch_agent_sessions_count, fetch_agent_verified_payment_events, fetch_checkout_funnel_stats, fetch_completed_recoveries, fetch_realized_upsells, fetch_verified_payments
+
+MIN_CONVERSION_SAMPLE = 3
 
 
 def _demo_metrics() -> dict:
@@ -62,6 +64,40 @@ def _agent_linked_payment_ids() -> set[str]:
     return linked
 
 
+def _funnel_metrics() -> dict:
+    rows = fetch_checkout_funnel_stats()
+    stats = {
+        "agent_sessions": 0,
+        "agent_converted": 0,
+        "direct_sessions": 0,
+        "direct_converted": 0,
+    }
+    for row in rows:
+        channel = row.get("channel")
+        status = row.get("status")
+        if channel == "agent":
+            stats["agent_sessions"] += 1
+            if status == "converted":
+                stats["agent_converted"] += 1
+        elif channel == "direct":
+            stats["direct_sessions"] += 1
+            if status == "converted":
+                stats["direct_converted"] += 1
+    agent_rate = round((stats["agent_converted"] / stats["agent_sessions"]) * 100, 2) if stats["agent_sessions"] else None
+    direct_rate = round((stats["direct_converted"] / stats["direct_sessions"]) * 100, 2) if stats["direct_sessions"] else None
+    lift = None
+    label = "Insufficient baseline data"
+    if (
+        stats["agent_sessions"] >= MIN_CONVERSION_SAMPLE
+        and stats["direct_sessions"] >= MIN_CONVERSION_SAMPLE
+        and direct_rate
+        and agent_rate is not None
+    ):
+        lift = round(((agent_rate - direct_rate) / direct_rate) * 100, 2)
+        label = f"Agent conversion {agent_rate}% vs baseline {direct_rate}%"
+    return {**stats, "agent_conversion_rate": agent_rate, "baseline_conversion_rate": direct_rate, "conversion_lift": lift, "conversion_lift_label": label}
+
+
 def merchant_metrics() -> dict:
     if config.demo_mode:
         return {
@@ -78,9 +114,16 @@ def merchant_metrics() -> dict:
     revenue = sum(_payment_amount_inr(payment) for payment in agent_payments)
     transactions = len(agent_payments)
     verified_transactions = len(payments)
-    sessions = fetch_agent_sessions_count()
-    agent_conversion_rate = round((transactions / sessions) * 100, 2) if sessions else None
+    persisted_sessions = fetch_agent_sessions_count()
+    funnel = _funnel_metrics()
+    sessions = funnel["agent_sessions"] or persisted_sessions
+    agent_conversion_rate = funnel["agent_conversion_rate"] if funnel["agent_conversion_rate"] is not None else (round((transactions / persisted_sessions) * 100, 2) if persisted_sessions else None)
     average_order_value = round(revenue / transactions) if transactions else 0
+    upsells = fetch_realized_upsells()
+    upsell_revenue = sum(int(item.get("realized_revenue_inr") or 0) for item in upsells)
+    upsell_order_ids = {item.get("realized_order_id") for item in upsells if item.get("realized_order_id")}
+    recoveries = fetch_completed_recoveries()
+    recovered_revenue = sum(int(item.get("recovered_amount_inr") or 0) for item in recoveries)
     return {
         "mode": "real",
         "ai_assisted_revenue": revenue,
@@ -88,22 +131,22 @@ def merchant_metrics() -> dict:
         "all_verified_transactions": verified_transactions,
         "agent_conversion_rate": agent_conversion_rate,
         "conversion_rate": agent_conversion_rate,
-        "conversion_lift": None,
-        "baseline_conversion_rate": None,
-        "conversion_lift_label": "Insufficient baseline data",
+        "conversion_lift": funnel["conversion_lift"],
+        "baseline_conversion_rate": funnel["baseline_conversion_rate"],
+        "conversion_lift_label": funnel["conversion_lift_label"],
         "average_order_value": average_order_value,
-        "upsell_revenue": 0,
-        "upsell_transactions": 0,
-        "upsell_revenue_label": "No attributed upsell purchases yet.",
-        "recovered_revenue": 0,
-        "recovered_transactions": 0,
-        "recovered_revenue_label": "No recovered transactions yet.",
+        "upsell_revenue": upsell_revenue,
+        "upsell_transactions": len(upsell_order_ids),
+        "upsell_revenue_label": "Revenue from accepted agent recommendations." if upsell_revenue else "No attributed upsell purchases yet.",
+        "recovered_revenue": recovered_revenue,
+        "recovered_transactions": len(recoveries),
+        "recovered_revenue_label": "Verified revenue recovered from preserved carts." if recovered_revenue else "No recovered transactions yet.",
         "agent_sessions": sessions,
         "transactions": transactions,
         "metrics_source": {
             "ai_assisted_revenue": "verified payments linked to persisted agent sessions",
             "all_verified_transactions": "all verified payment rows",
-            "upsell_revenue": "no persisted upsell attribution rows available",
-            "recovered_revenue": "no persisted recovery attribution rows available",
+            "upsell_revenue": "realized accepted cross-sell recommendations linked to verified payments",
+            "recovered_revenue": "completed recovery attempts linked to verified payments",
         },
     }

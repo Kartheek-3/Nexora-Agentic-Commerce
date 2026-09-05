@@ -106,7 +106,7 @@ export default function MerchantDashboard({ focus }: { focus?: string }) {
     source.addEventListener("nexora.audit", (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as MerchantActivity;
       setLiveActivity((items) => mergeActivity(items, [payload]));
-      if (payload.event_type === "PAYMENT_VERIFIED") {
+      if (["PAYMENT_VERIFIED", "UPSELL_ATTRIBUTED", "RECOVERY_COMPLETED", "CROSS_SELL_ACCEPTED"].includes(payload.event_type)) {
         refreshAnalytics();
       }
     });

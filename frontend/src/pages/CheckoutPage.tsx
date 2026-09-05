@@ -1,8 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { AuthorizationPanel } from "../components/checkout/AuthorizationPanel";
 import { products } from "../data/demo";
-import { authorizeCheckout, createCheckoutOrder, recordCheckoutFailure, verifyCheckoutPayment, type CheckoutOrder } from "../services/checkout";
+import { authorizeCheckout, createCheckoutOrder, recordCheckoutFailure, startCheckoutFunnel, verifyCheckoutPayment, type CheckoutOrder } from "../services/checkout";
 
 type RazorpayResponse = {
   razorpay_payment_id: string;
@@ -73,11 +73,38 @@ export default function CheckoutPage() {
   const locationState = location.state as { agentSessionId?: string } | null;
   const agentSessionId = locationState?.agentSessionId || sessionStorage.getItem("nexora_agent_session_id");
   const idempotencyKey = agentSessionId ? `nexora_checkout_${agentSessionId}` : "demo_birthday_checkout";
+  const directFunnelKeyRef = useRef(sessionStorage.getItem("nexora_direct_funnel_key") || `direct_${crypto.randomUUID()}`);
+  const funnelKey = agentSessionId ? `agent_${agentSessionId}` : directFunnelKeyRef.current;
   const [message, setMessage] = useState("");
+  const [funnelSessionId, setFunnelSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const paymentCompletedRef = useRef(false);
   const navigationStartedRef = useRef(false);
   const items = products.filter((product) => ["NEC102", "JCA210"].includes(product.id)).map((product) => ({ ...product, quantity: 1 }));
+
+  useEffect(() => {
+    if (!agentSessionId && !sessionStorage.getItem("nexora_direct_funnel_key")) {
+      sessionStorage.setItem("nexora_direct_funnel_key", funnelKey);
+    }
+    let active = true;
+    startCheckoutFunnel(funnelKey, agentSessionId)
+      .then((funnel) => {
+        if (active) setFunnelSessionId(funnel.funnel_session_id);
+      })
+      .catch(() => {
+        if (active) setFunnelSessionId(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [agentSessionId, funnelKey]);
+
+  const ensureFunnelSession = async () => {
+    if (funnelSessionId) return funnelSessionId;
+    const funnel = await startCheckoutFunnel(funnelKey, agentSessionId);
+    setFunnelSessionId(funnel.funnel_session_id);
+    return funnel.funnel_session_id;
+  };
 
   const navigateOnce = (path: "/payment/success" | "/payment/failure") => {
     if (navigationStartedRef.current) return;
@@ -93,12 +120,14 @@ export default function CheckoutPage() {
     setLoading(true);
     setMessage("Creating Razorpay test order...");
     let order: CheckoutOrder | null = null;
+    let activeFunnelSessionId = funnelSessionId;
     try {
+      activeFunnelSessionId = await ensureFunnelSession();
       setMessage("Recording checkout authorization...");
-      const authorization = await authorizeCheckout("demo_cart_birthday", idempotencyKey, agentSessionId);
+      const authorization = await authorizeCheckout("demo_cart_birthday", idempotencyKey, agentSessionId, activeFunnelSessionId);
       console.log("[checkout] creating order");
       setMessage("Creating Razorpay test order...");
-      order = await createCheckoutOrder(authorization.cart_id, idempotencyKey, authorization.authorization_id, agentSessionId);
+      order = await createCheckoutOrder(authorization.cart_id, idempotencyKey, authorization.authorization_id, agentSessionId, activeFunnelSessionId);
       console.log("[checkout] order created", { orderId: order.order_id, amount: order.amount, currency: order.currency });
       const orderIdValid = order.order_id.startsWith("order_");
       const amountValid = order.amount === 369800;
@@ -151,7 +180,7 @@ export default function CheckoutPage() {
           ondismiss: async () => {
             if (paymentCompletedRef.current) return;
             console.log("[checkout] Razorpay checkout dismissed");
-            await recordCheckoutFailure(order?.order_id || "unknown", "checkout_cancelled");
+            await recordCheckoutFailure(order?.order_id || "unknown", "checkout_cancelled", activeFunnelSessionId);
             navigateOnce("/payment/failure");
           },
         },
@@ -161,7 +190,7 @@ export default function CheckoutPage() {
       console.log("[checkout] opening Razorpay");
       checkout.open();
     } catch (error) {
-      if (order?.order_id) await recordCheckoutFailure(order.order_id, "checkout_error");
+      if (order?.order_id) await recordCheckoutFailure(order.order_id, "checkout_error", activeFunnelSessionId);
       setMessage(checkoutErrorMessage(error));
     } finally {
       setLoading(false);

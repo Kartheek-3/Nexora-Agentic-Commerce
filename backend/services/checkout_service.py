@@ -18,15 +18,27 @@ from backend.services.supabase_service import (
     create_order_item_records,
     create_order_record,
     create_payment_record,
+    create_checkout_funnel,
+    create_recovery_attempt,
     fetch_agent_action,
+    fetch_agent_action_by_razorpay_order,
+    fetch_accepted_recommendations_for_session,
     fetch_cart_with_items,
+    fetch_checkout_funnel_by_id,
     fetch_demo_checkout_cart,
     fetch_merchant_by_name,
     fetch_order_by_razorpay_id,
+    fetch_order_items,
     fetch_payment_by_razorpay_id,
+    fetch_pending_recovery_for_cart,
     fetch_profile_by_firebase_uid,
     fetch_agent_session,
     fetch_products_by_skus,
+    fetch_recovery_by_original_order,
+    complete_recovery_attempt,
+    convert_checkout_funnel,
+    abandon_checkout_funnel,
+    mark_recommendation_realized,
     get_supabase_client,
     update_agent_action,
     update_order_by_razorpay_id,
@@ -150,6 +162,16 @@ def _validated_agent_session_id(agent_session_id: str | None) -> str | None:
     return agent_session_id
 
 
+def _validated_funnel_session_id(funnel_session_id: str | None) -> str | None:
+    if not funnel_session_id:
+        return None
+    if not _is_uuid(funnel_session_id):
+        raise CheckoutError("Checkout funnel session id is invalid.", 422, "FUNNEL_SESSION_INVALID")
+    if not fetch_checkout_funnel_by_id(funnel_session_id):
+        raise CheckoutError("Checkout funnel session could not be found.", 404, "FUNNEL_SESSION_NOT_FOUND")
+    return funnel_session_id
+
+
 def _audit(event_type: str, description: str, status: str, metadata: dict[str, Any]) -> None:
     if config.demo_mode:
         return
@@ -175,6 +197,94 @@ def _audit(event_type: str, description: str, status: str, metadata: dict[str, A
     except Exception as exc:
         _authorize_log("audit insert failed", event_type=event_type, exception=type(exc).__name__)
         raise CheckoutError("Audit log could not be recorded.", 502, "AUDIT_WRITE_FAILED") from exc
+
+
+def _find_action_by_order_id(razorpay_order_id: str) -> dict | None:
+    return fetch_agent_action_by_razorpay_order(razorpay_order_id) if razorpay_order_id else None
+
+
+def start_checkout_funnel(funnel_key: str, firebase_uid: str, email: str | None = None, agent_session_id: str | None = None) -> dict:
+    if config.demo_mode:
+        channel = "agent" if agent_session_id else "direct"
+        return {"funnel_session_id": funnel_key, "channel": channel}
+    if get_supabase_client() is None:
+        raise CheckoutError("Supabase is not configured.", 502, "SUPABASE_UNAVAILABLE")
+    agent_session_id = _validated_agent_session_id(agent_session_id)
+    profile = _profile_for_user(firebase_uid, email)
+    merchant = fetch_merchant_by_name("NEXORA Demo Store")
+    if not merchant:
+        raise CheckoutError("Demo merchant is not seeded.", 422, "DEMO_STORE_NOT_FOUND")
+    channel = "agent" if agent_session_id else "direct"
+    funnel = create_checkout_funnel({"merchant_id": merchant["id"], "profile_id": profile["id"], "agent_session_id": agent_session_id, "channel": channel, "status": "started", "funnel_key": funnel_key})
+    record_metadata = {"merchant_id": merchant["id"], "agent_session_id": agent_session_id, "funnel_session_id": funnel.get("id"), "channel": channel, "risk_level": "LOW"}
+    _audit("CHECKOUT_FUNNEL_STARTED", "Checkout funnel session started.", "COMPLETED", record_metadata)
+    return {"funnel_session_id": funnel.get("id"), "channel": channel}
+
+
+def _realize_accepted_upsells(agent_session_id: str | None, order_row: dict, payment_row: dict) -> None:
+    if not agent_session_id or not order_row.get("id") or not payment_row.get("id"):
+        return
+    accepted = fetch_accepted_recommendations_for_session(agent_session_id)
+    if not accepted:
+        return
+    items = fetch_order_items(order_row["id"])
+    for recommendation in accepted:
+        product_id = recommendation.get("product_id")
+        matching_items = [item for item in items if item.get("product_id") == product_id]
+        if not matching_items:
+            continue
+        revenue = sum(int(item.get("unit_price_inr") or 0) * int(item.get("quantity") or 0) for item in matching_items)
+        if revenue <= 0:
+            continue
+        realized = mark_recommendation_realized(recommendation["id"], order_row["id"], payment_row["id"], revenue)
+        if realized.get("id"):
+            _audit("UPSELL_ATTRIBUTED", "Accepted cross-sell recommendation was realized by a verified payment.", "COMPLETED", {"merchant_id": order_row.get("merchant_id"), "agent_session_id": agent_session_id, "recommendation_id": recommendation["id"], "product_id": product_id, "realized_revenue_inr": revenue, "authorization_status": "APPROVED"})
+
+
+def _complete_pending_recovery(order_row: dict, payment_row: dict, action: dict) -> None:
+    cart_id = order_row.get("cart_session_id")
+    if not cart_id:
+        return
+    recovery = fetch_pending_recovery_for_cart(cart_id)
+    if not recovery:
+        return
+    if recovery.get("merchant_id") and recovery["merchant_id"] != order_row.get("merchant_id"):
+        return
+    completed = complete_recovery_attempt(recovery["id"], {"recovered_order_id": order_row["id"], "recovered_razorpay_payment_id": payment_row.get("razorpay_payment_id"), "recovered_amount_inr": int(order_row.get("total_inr") or 0), "recovered_at": _now()})
+    if completed.get("id"):
+        funnel_id = (action.get("requested_payload") or {}).get("funnel_session_id")
+        _audit("RECOVERY_COMPLETED", "Customer completed payment for a previously failed preserved cart.", "COMPLETED", {"merchant_id": order_row.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "recovery_attempt_id": recovery["id"], "order_id": order_row["id"], "recovered_amount_inr": int(order_row.get("total_inr") or 0), "funnel_session_id": funnel_id, "authorization_status": "APPROVED"})
+
+
+def record_checkout_failure_attempt(razorpay_order_id: str, reason: str, funnel_session_id: str | None = None) -> dict:
+    if config.demo_mode:
+        return {"order_id": razorpay_order_id, "cart_preserved": True, "duplicate_execution_prevented": True, "reason": reason}
+    funnel_session_id = _validated_funnel_session_id(funnel_session_id)
+    order_row = fetch_order_by_razorpay_id(razorpay_order_id)
+    if not order_row:
+        return {"order_id": razorpay_order_id, "cart_preserved": False, "duplicate_execution_prevented": True, "reason": reason}
+    action = _find_action_by_order_id(razorpay_order_id) or {}
+    existing = fetch_recovery_by_original_order(order_row["id"])
+    if not existing:
+        existing = create_recovery_attempt(
+            {
+                "merchant_id": order_row.get("merchant_id"),
+                "customer_id": order_row.get("customer_id"),
+                "agent_session_id": action.get("agent_session_id"),
+                "cart_session_id": order_row.get("cart_session_id"),
+                "original_order_id": order_row.get("id"),
+                "original_razorpay_order_id": razorpay_order_id,
+                "failure_reason": reason,
+                "status": "pending",
+            }
+        )
+    if funnel_session_id:
+        abandoned = abandon_checkout_funnel(funnel_session_id)
+        if abandoned.get("id"):
+            _audit("CHECKOUT_FUNNEL_ABANDONED", "Checkout funnel was abandoned after failed payment attempt.", "COMPLETED", {"merchant_id": order_row.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "funnel_session_id": funnel_session_id, "order_id": order_row.get("id")})
+    for event_type, status in [("PAYMENT_FAILED", "FAILED"), ("CART_PRESERVED", "COMPLETED"), ("RECOVERY_STARTED", "COMPLETED")]:
+        _audit(event_type, "Payment failure recorded against a persisted order and preserved cart.", status, {"merchant_id": order_row.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "recovery_attempt_id": existing.get("id"), "order_id": order_row.get("id"), "razorpay_order_id": razorpay_order_id, "failure_reason": reason, "funnel_session_id": funnel_session_id})
+    return {"order_id": razorpay_order_id, "cart_preserved": bool(order_row.get("cart_session_id")), "duplicate_execution_prevented": True, "recovery_attempt_id": existing.get("id"), "reason": reason}
 
 
 def _validated_real_cart(cart_id: str) -> tuple[dict, list[dict], int]:
@@ -329,7 +439,7 @@ def _resolve_checkout_cart(cart_id: str, idempotency_key: str, firebase_uid: str
     return cart["id"]
 
 
-def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None) -> dict:
+def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None, funnel_session_id: str | None = None) -> dict:
     timer = AuthorizeTimer()
     timer.mark("request received", cart_id=cart_id, idempotency_key_present=bool(idempotency_key))
     if config.demo_mode:
@@ -342,6 +452,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
     if get_supabase_client() is None:
         raise CheckoutError("Supabase is not configured.", 502, "SUPABASE_UNAVAILABLE")
     agent_session_id = _validated_agent_session_id(agent_session_id)
+    funnel_session_id = _validated_funnel_session_id(funnel_session_id)
     timer.mark("agent session linked", linked=bool(agent_session_id))
 
     timer.mark("firebase verified", uid_present=bool(firebase_uid))
@@ -414,7 +525,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
                         "approved_by": profile["id"],
                         "approved_at": _now(),
                         "execution_status": "APPROVED",
-                        "requested_payload": {**requested, "cart_id": resolved_cart_id},
+                        "requested_payload": {**requested, "cart_id": resolved_cart_id, "funnel_session_id": funnel_session_id or requested.get("funnel_session_id")},
                         "updated_at": _now(),
                     },
                 )
@@ -423,7 +534,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
             raise CheckoutError("Checkout authorization could not be recorded.", 502, "AGENT_ACTION_UPDATE_FAILED") from exc
         timer.mark("authorization persisted", authorization_id=updated.get("id", existing["id"]))
         with timer.stage("audit persistence"):
-            _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": existing_session_id or agent_session_id, "checkout_request_id": existing["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
+            _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": existing_session_id or agent_session_id, "funnel_session_id": funnel_session_id or requested.get("funnel_session_id"), "checkout_request_id": existing["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
         timer.mark("returning response", authorization_id=updated.get("id", existing["id"]))
         timer.summary()
         return {"authorization_id": updated.get("id", existing["id"]), "status": "approved", "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "idempotent_replay": True}
@@ -437,7 +548,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
                     "merchant_id": cart["merchant_id"],
                     "agent_session_id": agent_session_id,
                     "action_type": "create_order",
-                    "requested_payload": {"cart_id": resolved_cart_id, "source_cart_id": cart_id},
+                    "requested_payload": {"cart_id": resolved_cart_id, "source_cart_id": cart_id, "funnel_session_id": funnel_session_id},
                     "decision_summary": "Customer approved birthday gift checkout.",
                     "risk_level": "LOW",
                     "requires_approval": True,
@@ -457,7 +568,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
     timer.mark("authorization persisted", authorization_id=action["id"])
     timer.mark("authorization session linked", linked=bool(agent_session_id))
     with timer.stage("audit persistence"):
-        _audit("CART_PREPARED", "Checkout cart prepared from trusted Supabase products.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "cart_id": resolved_cart_id, "item_count": len(items), "amount_inr": total, "amount": amount_paise, "currency": "INR", "authorization_status": "REQUIRED"})
+        _audit("CART_PREPARED", "Checkout cart prepared from trusted Supabase products.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "funnel_session_id": funnel_session_id, "checkout_request_id": action["id"], "cart_id": resolved_cart_id, "item_count": len(items), "amount_inr": total, "amount": amount_paise, "currency": "INR", "authorization_status": "REQUIRED"})
         _audit("POLICY_CHECK_PASSED", policy["decision_summary"], "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "risk_level": policy["risk_level"], "authorization_status": "APPROVED", "amount": total, "maximum_allowed": 10000, "decision": policy.get("decision")})
         _audit("USER_AUTHORIZATION_RECEIVED", "Authenticated user approved checkout.", "COMPLETED", {"merchant_id": cart["merchant_id"], "agent_session_id": agent_session_id, "checkout_request_id": action["id"], "authorization_id": action["id"], "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "authorization_status": "APPROVED", "actor_type": "customer", "actor_id": profile["id"]})
     timer.mark("returning response", authorization_id=action["id"])
@@ -465,7 +576,7 @@ def authorize_checkout(cart_id: str, idempotency_key: str, firebase_uid: str, ag
     return {"authorization_id": action["id"], "status": "approved", "cart_id": resolved_cart_id, "amount": amount_paise, "currency": "INR", "idempotent_replay": False}
 
 
-def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None) -> dict:
+def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str, agent_action_id: str | None = None, email: str | None = None, agent_session_id: str | None = None, funnel_session_id: str | None = None) -> dict:
     _safe_log("request received", cart_id=cart_id, idempotency_key=idempotency_key)
     if config.demo_mode:
         cart = DEMO_CARTS.get(cart_id)
@@ -483,6 +594,7 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
     if get_supabase_client() is None:
         raise CheckoutError("Supabase is not configured.", 502, "SUPABASE_UNAVAILABLE")
     agent_session_id = _validated_agent_session_id(agent_session_id)
+    funnel_session_id = _validated_funnel_session_id(funnel_session_id)
     _safe_log("agent session linked", linked=bool(agent_session_id))
 
     _safe_log("firebase authenticated", uid_present=bool(firebase_uid))
@@ -502,6 +614,14 @@ def create_checkout_order(cart_id: str, idempotency_key: str, firebase_uid: str,
         action = update_agent_action(action["id"], {"agent_session_id": agent_session_id, "updated_at": _now()}) or action
         action_session_id = agent_session_id
     _safe_log("authorization session linked", linked=bool(action_session_id))
+    requested_payload = action.get("requested_payload") or {}
+    action_funnel_id = requested_payload.get("funnel_session_id")
+    if funnel_session_id and action_funnel_id and action_funnel_id != funnel_session_id:
+        raise CheckoutError("Checkout authorization belongs to a different funnel session.", 409, "FUNNEL_SESSION_MISMATCH")
+    if funnel_session_id and not action_funnel_id:
+        requested_payload = {**requested_payload, "funnel_session_id": funnel_session_id}
+        action = update_agent_action(action["id"], {"requested_payload": requested_payload, "updated_at": _now()}) or action
+        action_funnel_id = funnel_session_id
     _safe_log("authorization valid", action_id=action.get("id"))
     checkout_request_id = action["id"]
     result = action.get("execution_result") or {}
@@ -589,8 +709,17 @@ def verify_checkout_payment(checkout_request_id: str | None, razorpay_order_id: 
         raise CheckoutError("Stored order not found.", 409, "ORDER_NOT_FOUND")
     payment = fetch_payment(razorpay_payment_id)
     create_payment_record({"order_id": order_row["id"], "razorpay_payment_id": razorpay_payment_id, "razorpay_order_id": razorpay_order_id, "amount_inr": order_row["total_inr"], "status": "verified", "raw_payload": {"checkout_request_id": checkout_request_id, "provider_status": payment.get("status")}})
+    payment_row = fetch_payment_by_razorpay_id(razorpay_payment_id)
     update_order_by_razorpay_id(razorpay_order_id, {"status": "verified", "updated_at": _now()})
     update_agent_action(checkout_request_id, {"execution_status": "PAYMENT_VERIFIED", "execution_result": {**result, "payment_id": razorpay_payment_id, "verified_at": _now()}})
     _safe_log("payment attribution session linked", linked=bool(action.get("agent_session_id")))
+    funnel_id = (action.get("requested_payload") or {}).get("funnel_session_id")
+    if funnel_id:
+        converted = convert_checkout_funnel(funnel_id)
+        if converted.get("id"):
+            _audit("CHECKOUT_FUNNEL_CONVERTED", "Checkout funnel converted after verified payment.", "COMPLETED", {"merchant_id": action.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "funnel_session_id": funnel_id, "checkout_request_id": checkout_request_id, "authorization_status": "APPROVED"})
+    if payment_row:
+        _realize_accepted_upsells(action.get("agent_session_id"), order_row, payment_row)
+        _complete_pending_recovery(order_row, payment_row, action)
     _audit("PAYMENT_VERIFIED", "Payment signature verified and persisted.", "COMPLETED", {"merchant_id": action.get("merchant_id"), "agent_session_id": action.get("agent_session_id"), "checkout_request_id": checkout_request_id, "razorpay_order_id": razorpay_order_id, "razorpay_payment_id": razorpay_payment_id, "amount": order_row["total_inr"], "currency": "INR", "authorization_status": "APPROVED", "actor_type": "razorpay"})
     return {"verified": True, "status": "verified", "checkout_request_id": checkout_request_id, "order_id": razorpay_order_id, "payment_id": razorpay_payment_id}

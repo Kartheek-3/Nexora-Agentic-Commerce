@@ -7,7 +7,7 @@ from backend.config import config
 from backend.services.audit_service import record_event
 from backend.services.catalog_service import search_catalog
 from backend.services.llm_service import structure_intent_with_llm
-from backend.services.supabase_service import create_agent_session, fetch_merchant_by_name
+from backend.services.supabase_service import create_agent_session, create_recommendation, fetch_merchant_by_name
 
 
 class AgentPipelineError(RuntimeError):
@@ -83,6 +83,21 @@ def run_commerce_agent(message: str) -> dict:
         recommendations = [item for item in candidates if item.get("availability") and (budget_max is None or item.get("price", 0) <= budget_max)][:3]
         recommended_skus = [item.get("sku") or item.get("id") for item in recommendations]
         cross_sell = _recommend_session_cross_sell(recommendations[0], candidates, budget_max) if recommendations else None
+        if cross_sell and agent_session_id:
+            product = cross_sell.get("product") or {}
+            product_id = product.get("database_id") or product.get("id")
+            if product_id:
+                persisted = create_recommendation(
+                    {
+                        "agent_session_id": agent_session_id,
+                        "product_id": product_id,
+                        "recommendation_type": "cross_sell",
+                        "decision_summary": cross_sell.get("decision_summary"),
+                        "confidence": product.get("match_score"),
+                        "status": "proposed",
+                    }
+                )
+                cross_sell["recommendation_id"] = persisted.get("id")
     except Exception as exc:
         print(f"[agent] ranking failed request_id={request_id} exception={type(exc).__name__}", flush=True)
         raise AgentPipelineError("Commerce Agent is temporarily unavailable. Please try again.", "RANKING_FAILED") from exc
@@ -106,6 +121,22 @@ def run_commerce_agent(message: str) -> dict:
                 },
                 actor="agent",
                 action="rank_products",
+                session_id=request_id,
+                agent_session_id=agent_session_id,
+                merchant_id=merchant_id,
+            )
+        if cross_sell and cross_sell.get("recommendation_id"):
+            record_event(
+                "CROSS_SELL_PROPOSED",
+                "Commerce agent proposed a cross-sell recommendation.",
+                {
+                    "request_id": request_id,
+                    "recommendation_id": cross_sell.get("recommendation_id"),
+                    "product_id": (cross_sell.get("product") or {}).get("database_id") or (cross_sell.get("product") or {}).get("id"),
+                    "risk_level": "LOW",
+                },
+                actor="agent",
+                action="propose_cross_sell",
                 session_id=request_id,
                 agent_session_id=agent_session_id,
                 merchant_id=merchant_id,

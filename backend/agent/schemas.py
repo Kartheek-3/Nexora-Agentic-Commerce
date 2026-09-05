@@ -32,6 +32,7 @@ class CheckoutRequest(BaseModel):
     idempotency_key: str = Field(min_length=12)
     agent_action_id: str | None = None
     agent_session_id: UUID | None = None
+    funnel_session_id: UUID | None = None
 
 
 class AuthorizeCheckoutRequest(BaseModel):
@@ -39,6 +40,7 @@ class AuthorizeCheckoutRequest(BaseModel):
     idempotency_key: str = Field(min_length=12)
     agent_action_id: str | None = None
     agent_session_id: UUID | None = None
+    funnel_session_id: UUID | None = None
 
 
 class VerifyPaymentRequest(BaseModel):
@@ -51,3 +53,13 @@ class VerifyPaymentRequest(BaseModel):
 class FailureRequest(BaseModel):
     razorpay_order_id: str
     reason: str = "demo_failure"
+    funnel_session_id: UUID | None = None
+
+
+class RecommendationActionRequest(BaseModel):
+    agent_session_id: UUID
+
+
+class CheckoutFunnelStartRequest(BaseModel):
+    agent_session_id: UUID | None = None
+    funnel_key: str = Field(min_length=8)

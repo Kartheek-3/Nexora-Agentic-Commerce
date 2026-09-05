@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, g, request
 from pydantic import ValidationError
 
 from backend.agent.orchestrator import AgentPipelineError, run_commerce_agent
 from backend.agent.orchestrator import structure_intent
-from backend.agent.schemas import CheckoutRequest, SearchRequest
+from backend.agent.schemas import CheckoutRequest, RecommendationActionRequest, SearchRequest
 from backend.config import config
+from backend.middleware.firebase_auth import firebase_auth_required
 from backend.services.audit_service import record_event
 from backend.services.catalog_service import get_product, list_catalog, search_catalog
 from backend.services.guardrail_service import check_checkout
+from backend.services.supabase_service import accept_recommendation, decline_recommendation, fetch_recommendation
 from backend.utils.errors import fail, ok
 
 bp = Blueprint("agent", __name__, url_prefix="/api/agent")
@@ -54,6 +56,58 @@ def run():
             return fail("Agent prompt is required.", 400, "INVALID_AGENT_PROMPT")
         print(f"[agent] unexpected failure exception={type(exc).__name__}", flush=True)
         return fail("Commerce Agent is temporarily unavailable. Please try again.", 503, "AGENT_SERVICE_UNAVAILABLE")
+
+
+@bp.post("/recommendations/<recommendation_id>/accept")
+@firebase_auth_required
+def accept_cross_sell(recommendation_id: str):
+    try:
+        payload = RecommendationActionRequest.model_validate(request.get_json(force=True))
+    except ValidationError as exc:
+        return fail(exc.errors()[0]["msg"], 422, "VALIDATION_ERROR")
+    recommendation = fetch_recommendation(recommendation_id)
+    if not recommendation:
+        return fail("Recommendation not found.", 404, "RECOMMENDATION_NOT_FOUND")
+    agent_session_id = str(payload.agent_session_id)
+    if recommendation.get("agent_session_id") != agent_session_id:
+        return fail("Recommendation belongs to a different agent session.", 409, "RECOMMENDATION_SESSION_MISMATCH")
+    product = recommendation.get("products") or {}
+    price = int(product.get("price_inr") or 0)
+    accepted = accept_recommendation(recommendation_id, price)
+    record_event(
+        "CROSS_SELL_ACCEPTED",
+        "Customer accepted an agent cross-sell recommendation.",
+        {"recommendation_id": recommendation_id, "product_id": recommendation.get("product_id"), "risk_level": "LOW", "actor_id": g.user.get("uid")},
+        actor="customer",
+        action="accept_cross_sell",
+        agent_session_id=agent_session_id,
+    )
+    return ok({"recommendation_id": recommendation_id, "status": accepted.get("status", "accepted")})
+
+
+@bp.post("/recommendations/<recommendation_id>/decline")
+@firebase_auth_required
+def decline_cross_sell(recommendation_id: str):
+    try:
+        payload = RecommendationActionRequest.model_validate(request.get_json(force=True))
+    except ValidationError as exc:
+        return fail(exc.errors()[0]["msg"], 422, "VALIDATION_ERROR")
+    recommendation = fetch_recommendation(recommendation_id)
+    if not recommendation:
+        return fail("Recommendation not found.", 404, "RECOMMENDATION_NOT_FOUND")
+    agent_session_id = str(payload.agent_session_id)
+    if recommendation.get("agent_session_id") != agent_session_id:
+        return fail("Recommendation belongs to a different agent session.", 409, "RECOMMENDATION_SESSION_MISMATCH")
+    declined = decline_recommendation(recommendation_id)
+    record_event(
+        "CROSS_SELL_DECLINED",
+        "Customer declined an agent cross-sell recommendation.",
+        {"recommendation_id": recommendation_id, "product_id": recommendation.get("product_id"), "risk_level": "LOW", "actor_id": g.user.get("uid")},
+        actor="customer",
+        action="decline_cross_sell",
+        agent_session_id=agent_session_id,
+    )
+    return ok({"recommendation_id": recommendation_id, "status": declined.get("status", "declined")})
 
 
 @bp.post("/test-llm")

@@ -13,7 +13,7 @@ export type AgentRunResponse = {
   structured_intent: Record<string, unknown>;
   candidate_count: number;
   recommendations: Array<{ product: Product; score: number; reason: string; within_budget: boolean }>;
-  cross_sell: Array<{ product?: Product; new_total?: number; within_budget?: boolean; decision_summary?: string }>;
+  cross_sell: Array<{ recommendation_id?: string; product?: Product; new_total?: number; within_budget?: boolean; decision_summary?: string }>;
   constraints: Record<string, unknown>;
 };
 
@@ -28,4 +28,14 @@ export function agentErrorMessage(error: unknown) {
     return code ? `Commerce Agent is temporarily unavailable. Please try again. (${code})` : "Commerce Agent is temporarily unavailable. Please try again.";
   }
   return "Commerce Agent is temporarily unavailable. Please try again.";
+}
+
+export async function acceptRecommendation(recommendationId: string, agentSessionId: string) {
+  const response = await api.post<{ data: { recommendation_id: string; status: string } }>(`/agent/recommendations/${recommendationId}/accept`, { agent_session_id: agentSessionId });
+  return response.data.data;
+}
+
+export async function declineRecommendation(recommendationId: string, agentSessionId: string) {
+  const response = await api.post<{ data: { recommendation_id: string; status: string } }>(`/agent/recommendations/${recommendationId}/decline`, { agent_session_id: agentSessionId });
+  return response.data.data;
 }

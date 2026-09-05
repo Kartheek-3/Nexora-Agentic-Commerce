@@ -9,7 +9,7 @@ import { NexoraSurface } from "../components/ui/NexoraSurface";
 import { auditEvents, failureEvents } from "../data/demo";
 import { buildProductIntent, type SelectedProductIntent } from "../lib/productIntent";
 import { formatINR } from "../lib/utils";
-import { agentErrorMessage, runCommerceAgent, type AgentRunResponse } from "../services/agent";
+import { acceptRecommendation, agentErrorMessage, declineRecommendation, runCommerceAgent, type AgentRunResponse } from "../services/agent";
 import { runEvaluations, type EvaluationRun } from "../services/merchant";
 import type { CartItem, Product } from "../types/commerce";
 
@@ -91,13 +91,21 @@ export default function AgentPage({ merchant = false }: { merchant?: boolean }) 
     setSkippedCrossSellId("");
   };
 
-  const addCrossSell = () => {
+  const addCrossSell = async () => {
     if (!crossSell) return;
+    const recommendationId = crossSellProposal?.recommendation_id;
+    if (recommendationId && agentResult?.agent_session_id) {
+      await acceptRecommendation(recommendationId, agentResult.agent_session_id);
+    }
     setCart((items) => (items.some((item) => item.id === crossSell.id) ? items : [...items, { ...crossSell, quantity: 1 }]));
   };
 
-  const skipCrossSell = () => {
+  const skipCrossSell = async () => {
     if (!crossSell) return;
+    const recommendationId = crossSellProposal?.recommendation_id;
+    if (recommendationId && agentResult?.agent_session_id) {
+      declineRecommendation(recommendationId, agentResult.agent_session_id).catch(() => undefined);
+    }
     setSkippedCrossSellId(crossSell.id);
     setCart((items) => items.filter((item) => item.id !== crossSell.id));
   };
