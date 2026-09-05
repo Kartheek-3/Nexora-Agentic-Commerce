@@ -24,18 +24,7 @@ def create_app() -> Flask:
     app = Flask(__name__)
     CORS(
         app,
-        resources={
-            r"/api/*": {
-                "origins": [
-                    config.frontend_url,
-                    "https://nexora-agentic-commerce-nu.vercel.app",
-                    "https://nexora-anwg1h8ya-kartheeks-projects-640e3f8b.vercel.app",
-                    r"https://nexora-.*\.vercel\.app",
-                    "http://127.0.0.1:5173",
-                    "http://localhost:5173",
-                ]
-            }
-        },
+        resources={r"/api/*": {"origins": [config.frontend_url, "http://127.0.0.1:5173", "http://localhost:5173",r"https://nexora-.*\.vercel\.app", "https://nexora-agentic-commerce-nu.vercel.app", "https://nexora-agentic-commerce-infrastructure-2e4u638ru.vercel.app"]}},
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         supports_credentials=False,
