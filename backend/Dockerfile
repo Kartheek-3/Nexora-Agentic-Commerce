@@ -7,12 +7,13 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-RUN python -m pip install --upgrade pip setuptools wheel \
+RUN python -m pip install --upgrade pip wheel \
+    && python -m pip install "setuptools==80.9.0" \
     && python -m pip install --no-cache-dir -r requirements.txt
 
 # IMPORTANT:
 # Fail the Docker build immediately if Razorpay cannot be imported.
-RUN python -c "import razorpay; print('razorpay import OK')"
+RUN python -c "import razorpay; import pkg_resources; print('razorpay import OK')"
 
 COPY . ./backend
 
