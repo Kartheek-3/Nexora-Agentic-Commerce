@@ -79,7 +79,7 @@ export default function CheckoutPage() {
     if (navigationStartedRef.current) return;
     navigationStartedRef.current = true;
     console.log("[checkout] navigation started:", path);
-    window.location.assign(path);
+    navigate(path, { replace: true });
   };
 
   const handleApprove = async () => {
